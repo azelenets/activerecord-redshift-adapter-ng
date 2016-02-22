@@ -18,6 +18,7 @@ module ActiveRecord
           create_sql << "#{quote_table_name(o.name)} "
           create_sql << "(#{o.columns.map { |c| accept c }.join(', ')}) " unless o.as
           create_sql << "#{o.options}"
+          create_sql << "DISTSTYLE #{o.diststyle} " if o.diststyle
           create_sql << "DISTKEY (#{o.distkey}) " if o.distkey
           create_sql << "SORTKEY (#{o.sortkey.join(', ')}) " if o.sortkey
           create_sql << " AS #{@conn.to_sql(o.as)}" if o.as
