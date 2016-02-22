@@ -13,14 +13,14 @@ require 'active_record/connection_adapters/redshift/database_statements'
 require 'arel/visitors/bind_visitor'
 
 # Make sure we're using pg high enough for PGResult#values
-gem 'pg', '> 0.15'
+gem 'pg', '~> 0.15'
 require 'pg'
 
 require 'ipaddr'
 
 module ActiveRecord
   module ConnectionHandling # :nodoc:
-    RS_VALID_CONN_PARAMS = [:host, :hostaddr, :port, :dbname, :user, :password, :connect_timeout,
+    VALID_CONN_PARAMS = [:host, :hostaddr, :port, :dbname, :user, :password, :connect_timeout,
                          :client_encoding, :options, :application_name, :fallback_application_name,
                          :keepalives, :keepalives_idle, :keepalives_interval, :keepalives_count,
                          :tty, :sslmode, :requiressl, :sslcompression, :sslcert, :sslkey,
@@ -37,7 +37,7 @@ module ActiveRecord
       conn_params[:dbname] = conn_params.delete(:database) if conn_params[:database]
 
       # Forward only valid config params to PGconn.connect.
-      conn_params.keep_if { |k, _| RS_VALID_CONN_PARAMS.include?(k) }
+      conn_params.keep_if { |k, _| VALID_CONN_PARAMS.include?(k) }
 
       # The postgres drivers don't allow the creation of an unconnected PGconn object,
       # so just pass a nil connection object for the time being.
@@ -64,7 +64,8 @@ module ActiveRecord
     #   <tt>SET client_min_messages TO <min_messages></tt> call on the connection.
     # * <tt>:variables</tt> - An optional hash of additional parameters that
     #   will be used in <tt>SET SESSION key = val</tt> calls on the connection.
-    # * <tt>:insert_returning</tt> - Does nothing for Redshift.
+    # * <tt>:insert_returning</tt> - An optional boolean to control the use or <tt>RETURNING</tt> for <tt>INSERT</tt> statements
+    #   defaults to true.
     #
     # Any further options are used as connection parameters to libpq. See
     # http://www.postgresql.org/docs/9.1/static/libpq-connect.html for the
@@ -76,17 +77,40 @@ module ActiveRecord
       ADAPTER_NAME = 'Redshift'.freeze
 
       NATIVE_DATABASE_TYPES = {
-        primary_key: "integer identity primary key",
-        string:      { name: "varchar" },
-        text:        { name: "varchar" },
+        primary_key: "integer identity",
+        bigserial:   { name: "bigint" },
+        string:      { name: "character varying" },
+        text:        { name: "text" },
         integer:     { name: "integer" },
         float:       { name: "float" },
         decimal:     { name: "decimal" },
         datetime:    { name: "timestamp" },
         time:        { name: "time" },
         date:        { name: "date" },
-        bigint:      { name: "bigint" },
+        daterange:   { name: "daterange" },
+        numrange:    { name: "numrange" },
+        tsrange:     { name: "tsrange" },
+        tstzrange:   { name: "tstzrange" },
+        int4range:   { name: "int4range" },
+        int8range:   { name: "int8range" },
+        binary:      { name: "bytea" },
         boolean:     { name: "boolean" },
+        bigint:      { name: "bigint" },
+        xml:         { name: "xml" },
+        tsvector:    { name: "tsvector" },
+        hstore:      { name: "hstore" },
+        inet:        { name: "inet" },
+        cidr:        { name: "cidr" },
+        macaddr:     { name: "macaddr" },
+        uuid:        { name: "uuid" },
+        json:        { name: "json" },
+        jsonb:       { name: "jsonb" },
+        ltree:       { name: "ltree" },
+        citext:      { name: "citext" },
+        point:       { name: "point" },
+        bit:         { name: "bit" },
+        bit_varying: { name: "bit varying" },
+        money:       { name: "money" },
       }
 
       OID = Redshift::OID #:nodoc:
@@ -95,6 +119,7 @@ module ActiveRecord
       include Redshift::ReferentialIntegrity
       include Redshift::SchemaStatements
       include Redshift::DatabaseStatements
+      include Savepoints
 
       def schema_creation # :nodoc:
         Redshift::SchemaCreation.new self
@@ -104,8 +129,14 @@ module ActiveRecord
       # AbstractAdapter
       def prepare_column_options(column, types) # :nodoc:
         spec = super
+        spec[:array] = 'true' if column.respond_to?(:array) && column.array
         spec[:default] = "\"#{column.default_function}\"" if column.default_function
         spec
+      end
+
+      # Adds +:array+ as a valid migration key
+      def migration_keys
+        super + [:array]
       end
 
       # Returns +true+, since this connection adapter supports prepared statement
@@ -115,15 +146,15 @@ module ActiveRecord
       end
 
       def supports_index_sort_order?
-        false
+        true
       end
 
       def supports_partial_index?
-        false
+        true
       end
 
       def supports_transaction_isolation?
-        false
+        true
       end
 
       def supports_foreign_keys?
@@ -196,8 +227,13 @@ module ActiveRecord
         super(connection, logger)
 
         @visitor = Arel::Visitors::PostgreSQL.new self
-        @prepared_statements = false
+        if self.class.type_cast_config_to_boolean(config.fetch(:prepared_statements) { true })
+          @prepared_statements = true
+        else
+          @prepared_statements = false
+        end
 
+        connection_parameters.delete :prepared_statements
         @connection_parameters, @config = connection_parameters, config
 
         # @local_tz is initialized as nil to avoid warnings when connect tries to use it
@@ -269,14 +305,6 @@ module ActiveRecord
         true
       end
 
-      # Enable standard-conforming strings if available.
-      def set_standard_conforming_strings
-        old, self.client_min_messages = client_min_messages, 'panic'
-        execute('SET standard_conforming_strings = on', 'SCHEMA') rescue nil
-      ensure
-        self.client_min_messages = old
-      end
-
       def supports_ddl_transactions?
         true
       end
@@ -285,30 +313,46 @@ module ActiveRecord
         true
       end
 
+      # Returns true if pg > 9.1
       def supports_extensions?
-        false
+        redshift_version >= 90100
       end
 
+      # Range datatypes weren't introduced until PostgreSQL 9.2
       def supports_ranges?
-        false
+        redshift_version >= 90200
       end
 
       def supports_materialized_views?
-        false
-      end
-
-      def supports_import?
-        true
+        redshift_version >= 90300
       end
 
       def enable_extension(name)
+        exec_query("CREATE EXTENSION IF NOT EXISTS \"#{name}\"").tap {
+          reload_type_map
+        }
       end
 
       def disable_extension(name)
+        exec_query("DROP EXTENSION IF EXISTS \"#{name}\" CASCADE").tap {
+          reload_type_map
+        }
       end
 
       def extension_enabled?(name)
-        false
+        if supports_extensions?
+          res = exec_query "SELECT EXISTS(SELECT * FROM pg_available_extensions WHERE name = '#{name}' AND installed_version IS NOT NULL) as enabled",
+            'SCHEMA'
+          res.cast_values.first
+        end
+      end
+
+      def extensions
+        if supports_extensions?
+          exec_query("SELECT extname from pg_extension", "SCHEMA").cast_values
+        else
+          super
+        end
       end
 
       # Returns the configured supported identifier length supported by PostgreSQL
@@ -356,13 +400,17 @@ module ActiveRecord
           @connection.server_version
         end
 
+        # See http://www.postgresql.org/docs/9.1/static/errcodes-appendix.html
+        FOREIGN_KEY_VIOLATION = "23503"
+        UNIQUE_VIOLATION      = "23505"
+
         def translate_exception(exception, message)
           return exception unless exception.respond_to?(:result)
 
-          case exception.message
-          when /duplicate key value violates unique constraint/
+          case exception.result.try(:error_field, PGresult::PG_DIAG_SQLSTATE)
+          when UNIQUE_VIOLATION
             RecordNotUnique.new(message, exception)
-          when /violates foreign key constraint/
+          when FOREIGN_KEY_VIOLATION
             InvalidForeignKey.new(message, exception)
           else
             super
@@ -377,7 +425,11 @@ module ActiveRecord
           end
 
           type_map.fetch(oid, fmod, sql_type) {
-            warn "unknown OID #{oid}: failed to recognize type of '#{column_name}'. It will be treated as String."
+            # oid=2205 maps to t2.oid::regclass, which seems to do fine as string
+            if oid != 2205
+              warn "unknown OID #{oid}: failed to recognize type of '#{column_name}'. It will be treated as String."
+            end
+
             Type::Value.new.tap do |cast_type|
               type_map.register_type(oid, cast_type)
             end
@@ -397,9 +449,35 @@ module ActiveRecord
           m.alias_type 'name', 'varchar'
           m.alias_type 'bpchar', 'varchar'
           m.register_type 'bool', Type::Boolean.new
+          register_class_with_limit m, 'bit', OID::Bit
+          register_class_with_limit m, 'varbit', OID::BitVarying
           m.alias_type 'timestamptz', 'timestamp'
           m.register_type 'date', OID::Date.new
           m.register_type 'time', OID::Time.new
+
+          m.register_type 'money', OID::Money.new
+          m.register_type 'bytea', OID::Bytea.new
+          m.register_type 'point', OID::Point.new
+          m.register_type 'hstore', OID::Hstore.new
+          m.register_type 'json', OID::Json.new
+          m.register_type 'jsonb', OID::Jsonb.new
+          m.register_type 'cidr', OID::Cidr.new
+          m.register_type 'inet', OID::Inet.new
+          m.register_type 'uuid', OID::Uuid.new
+          m.register_type 'xml', OID::Xml.new
+          m.register_type 'tsvector', OID::SpecializedString.new(:tsvector)
+          m.register_type 'macaddr', OID::SpecializedString.new(:macaddr)
+          m.register_type 'citext', OID::SpecializedString.new(:citext)
+          m.register_type 'ltree', OID::SpecializedString.new(:ltree)
+
+          # FIXME: why are we keeping these types as strings?
+          m.alias_type 'interval', 'varchar'
+          m.alias_type 'path', 'varchar'
+          m.alias_type 'line', 'varchar'
+          m.alias_type 'polygon', 'varchar'
+          m.alias_type 'circle', 'varchar'
+          m.alias_type 'lseg', 'varchar'
+          m.alias_type 'box', 'varchar'
 
           m.register_type 'timestamp' do |_, _, sql_type|
             precision = extract_precision(sql_type)
@@ -450,7 +528,7 @@ module ActiveRecord
             when 'true', 'false'
               default
             # Numeric types
-            when /\A\(?(-?\d+(\.\d*)?)\)?\z/
+            when /\A\(?(-?\d+(\.\d*)?)\)?(::bigint)?\z/
               $1
             # Object identifier types
             when /\A-?\d+\z/
@@ -471,8 +549,6 @@ module ActiveRecord
         end
 
         def load_additional_types(type_map, oids = nil) # :nodoc:
-          initializer = OID::TypeMapInitializer.new(type_map)
-
           if supports_ranges?
             query = <<-SQL
               SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, t.typtype, t.typbasetype
@@ -490,9 +566,9 @@ module ActiveRecord
             query += "WHERE t.oid::integer IN (%s)" % oids.join(", ")
           end
 
-          execute_and_clear(query, 'SCHEMA', []) do |records|
-            initializer.run(records)
-          end
+          initializer = OID::TypeMapInitializer.new(type_map)
+          records = execute(query, 'SCHEMA')
+          initializer.run(records)
         end
 
         FEATURE_NOT_SUPPORTED = "0A000" #:nodoc:
@@ -566,6 +642,11 @@ module ActiveRecord
         # connected server's characteristics.
         def connect
           @connection = PGconn.connect(@connection_parameters)
+
+          # Money type has a fixed precision of 10 in PostgreSQL 8.2 and below, and as of
+          # PostgreSQL 8.3 it has a fixed precision of 19. PostgreSQLColumn.extract_precision
+          # should know about this but can't detect it there, so deal with it here.
+          OID::Money.precision = (redshift_version >= 80300) ? 19 : 10
 
           configure_connection
         rescue ::PG::Error => error
