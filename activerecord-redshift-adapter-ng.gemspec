@@ -1,0 +1,23 @@
+Gem::Specification.new do |s|
+  s.platform = Gem::Platform::RUBY
+  s.name = 'activerecord-redshift-adapter-ng'
+  s.version = '0.9.0'
+  s.summary = 'Amazon Redshift adapter for ActiveRecord'
+  s.description = 'Amazon Redshift _makeshift_ adapter for ActiveRecord.'
+  s.license = 'MIT'
+
+  s.author = ['Minero Aoki']
+  s.email = 'aamine@loveruby.net'
+  s.homepage = 'http://github.com/aamine/activerecord-redshift-adapter-ng'
+
+  s.files = Dir.glob(['LICENSE', 'README.md', 'lib/**/*.rb'])
+  s.require_path = 'lib'
+
+  s.required_ruby_version = '>= 2.0.0'
+
+  s.add_dependency 'pg'
+  s.add_dependency 'activerecord', ['~> 4.2.0']
+
+  s.add_development_dependency 'rake'
+  s.add_development_dependency 'erubis'
+end

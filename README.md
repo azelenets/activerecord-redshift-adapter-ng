@@ -1,8 +1,7 @@
-activerecord4-redshift-adapter
-==============================
+# activerecord-redshift-adapter-ng
 
-Amazon Redshift adapter for ActiveRecord 4 (Rails 4).
-I copied PostgreSQL driver from ActiveRecord 4.0.0 and modified for Redshift.
+Amazon Redshift adapter for ActiveRecord.
+I copied PostgreSQL driver from ActiveRecord and modified for Redshift.
 "Barely works" patch was borrowed from fiksu/activerecord-redshift-adapter.
 
 I know Redshift driver already exists (https://github.com/fiksu/activerecord-redshift-adapter),
@@ -15,13 +14,9 @@ I abandon this driver.
 Usage
 -------------------
 
-For Rails 4.2, write following in Gemfile:
+Write following in Gemfile:
 ```
-gem 'activerecord4-redshift-adapter', '~> 0.2.0'
-```
-For Rails 4.1:
-```
-gem 'activerecord4-redshift-adapter', '~> 0.1.1'
+gem 'activerecord-redshift-adapter-ng'
 ```
 
 In database.yml
