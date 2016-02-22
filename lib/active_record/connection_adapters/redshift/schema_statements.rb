@@ -30,6 +30,9 @@ module ActiveRecord
           else
             super
           end
+          if column.distkey
+            sql << " DISTKEY"
+          end
         end
 
         def type_for_column(column)

@@ -12,6 +12,7 @@ module ActiveRecord
       end
 
       class ColumnDefinition < ActiveRecord::ConnectionAdapters::ColumnDefinition
+        attr_accessor :distkey
       end
 
       class TableDefinition < ActiveRecord::ConnectionAdapters::TableDefinition
@@ -57,6 +58,12 @@ module ActiveRecord
           options[:default] = options.fetch(:default, 'uuid_generate_v4()')
           options[:primary_key] = true
           column name, type, options
+        end
+
+        def new_column_definition(_name, _type, options = {})
+          col = super
+          col.distkey = options[:distkey]
+          col
         end
 
         private
