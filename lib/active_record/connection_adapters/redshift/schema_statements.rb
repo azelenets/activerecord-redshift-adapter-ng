@@ -13,6 +13,16 @@ module ActiveRecord
           sql
         end
 
+        def visit_TableDefinition(o)
+          create_sql = "CREATE#{' TEMPORARY' if o.temporary} TABLE "
+          create_sql << "#{quote_table_name(o.name)} "
+          create_sql << "(#{o.columns.map { |c| accept c }.join(', ')}) " unless o.as
+          create_sql << "#{o.options}"
+          create_sql << "DISTKEY (#{o.distkey}) " if o.distkey
+          create_sql << " AS #{@conn.to_sql(o.as)}" if o.as
+          create_sql
+        end
+
         def add_column_options!(sql, options)
           column = options.fetch(:column) { return super }
           if column.type == :uuid && options[:default] =~ /\(\)/

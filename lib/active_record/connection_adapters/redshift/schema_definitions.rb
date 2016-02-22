@@ -17,6 +17,13 @@ module ActiveRecord
       class TableDefinition < ActiveRecord::ConnectionAdapters::TableDefinition
         include ColumnMethods
 
+        def distkey(column = nil)
+          unless column.nil?
+            @distkey = column
+          end
+          @distkey
+        end
+
         # Defines the primary key field.
         # Use of the native PostgreSQL UUID type is supported, and can be used
         # by defining your tables as such:
