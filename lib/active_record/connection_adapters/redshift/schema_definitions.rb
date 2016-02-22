@@ -12,7 +12,7 @@ module ActiveRecord
       end
 
       class ColumnDefinition < ActiveRecord::ConnectionAdapters::ColumnDefinition
-        attr_accessor :distkey
+        attr_accessor :distkey, :sortkey
       end
 
       class TableDefinition < ActiveRecord::ConnectionAdapters::TableDefinition
@@ -23,6 +23,20 @@ module ActiveRecord
             @distkey = column
           end
           @distkey
+        end
+
+        def sortkey(columns = nil)
+          unless columns.nil?
+            @sortkey = Array.wrap(columns)
+          end
+          @sortkey
+        end
+
+        def new_column_definition(_name, _type, options = {})
+          col = super
+          col.distkey = options[:distkey]
+          col.sortkey = options[:sortkey]
+          col
         end
 
         # Defines the primary key field.
@@ -58,12 +72,6 @@ module ActiveRecord
           options[:default] = options.fetch(:default, 'uuid_generate_v4()')
           options[:primary_key] = true
           column name, type, options
-        end
-
-        def new_column_definition(_name, _type, options = {})
-          col = super
-          col.distkey = options[:distkey]
-          col
         end
 
         private

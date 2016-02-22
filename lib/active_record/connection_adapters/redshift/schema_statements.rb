@@ -19,6 +19,7 @@ module ActiveRecord
           create_sql << "(#{o.columns.map { |c| accept c }.join(', ')}) " unless o.as
           create_sql << "#{o.options}"
           create_sql << "DISTKEY (#{o.distkey}) " if o.distkey
+          create_sql << "SORTKEY (#{o.sortkey.join(', ')}) " if o.sortkey
           create_sql << " AS #{@conn.to_sql(o.as)}" if o.as
           create_sql
         end
@@ -33,6 +34,10 @@ module ActiveRecord
           if column.distkey
             sql << " DISTKEY"
           end
+          if column.sortkey
+            sql << " SORTKEY"
+          end
+          sql
         end
 
         def type_for_column(column)
