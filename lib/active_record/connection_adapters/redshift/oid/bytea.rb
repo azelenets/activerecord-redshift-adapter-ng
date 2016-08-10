@@ -3,7 +3,7 @@ module ActiveRecord
     module Redshift
       module OID # :nodoc:
         class Bytea < Type::Binary # :nodoc:
-          def type_cast_from_database(value)
+          def deserialize(value)
             return if value.nil?
             PGconn.unescape_bytea(super)
           end

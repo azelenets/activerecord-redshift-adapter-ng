@@ -1,22 +1,19 @@
+require 'pg'
 require 'active_record/connection_adapters/abstract_adapter'
-require 'active_record/connection_adapters/statement_pool'
-
-require 'active_record/connection_adapters/redshift/utils'
 require 'active_record/connection_adapters/redshift/column'
+require 'active_record/connection_adapters/redshift/database_statements'
+require 'active_record/connection_adapters/redshift/explain_pretty_printer'
 require 'active_record/connection_adapters/redshift/oid'
 require 'active_record/connection_adapters/redshift/quoting'
 require 'active_record/connection_adapters/redshift/referential_integrity'
 require 'active_record/connection_adapters/redshift/schema_definitions'
+require 'active_record/connection_adapters/redshift/schema_dumper'
 require 'active_record/connection_adapters/redshift/schema_statements'
-require 'active_record/connection_adapters/redshift/database_statements'
+require 'active_record/connection_adapters/redshift/type_metadata'
+require 'active_record/connection_adapters/redshift/utils'
+require 'active_record/connection_adapters/statement_pool'
 
 require 'arel/visitors/bind_visitor'
-
-# Make sure we're using pg high enough for PGResult#values
-gem 'pg', '~> 0.15'
-require 'pg'
-
-require 'ipaddr'
 
 module ActiveRecord
   module ConnectionHandling # :nodoc:
@@ -119,27 +116,17 @@ module ActiveRecord
       include Redshift::ReferentialIntegrity
       include Redshift::SchemaStatements
       include Redshift::DatabaseStatements
-      include Savepoints
+      include Redshift::ColumnDumper
 
       def schema_creation # :nodoc:
         Redshift::SchemaCreation.new self
       end
 
-      # Adds +:array+ option to the default set provided by the
-      # AbstractAdapter
-      def prepare_column_options(column, types) # :nodoc:
-        spec = super
-        spec[:array] = 'true' if column.respond_to?(:array) && column.array
-        spec[:default] = "\"#{column.default_function}\"" if column.default_function
-        spec
+      def arel_visitor # :nodoc:
+        Arel::Visitors::PostgreSQL.new(self)
       end
 
-      # Adds +:array+ as a valid migration key
-      def migration_keys
-        super + [:array]
-      end
-
-      # Returns +true+, since this connection adapter supports prepared statement
+      # Returns true, since this connection adapter supports prepared statement
       # caching.
       def supports_statement_cache?
         true
@@ -150,6 +137,10 @@ module ActiveRecord
       end
 
       def supports_partial_index?
+        true
+      end
+
+      def supports_expression_index?
         true
       end
 
@@ -165,89 +156,74 @@ module ActiveRecord
         true
       end
 
+      def supports_datetime_with_precision?
+        true
+      end
+
+      def supports_json?
+        redshift_version >= 90200
+      end
+
+      def supports_comments?
+        true
+      end
+
+      def supports_savepoints?
+        true
+      end
+
       def index_algorithms
         { concurrently: 'CONCURRENTLY' }
       end
 
       class StatementPool < ConnectionAdapters::StatementPool
         def initialize(connection, max)
-          super
+          super(max)
+          @connection = connection
           @counter = 0
-          @cache   = Hash.new { |h,pid| h[pid] = {} }
         end
-
-        def each(&block); cache.each(&block); end
-        def key?(key);    cache.key?(key); end
-        def [](key);      cache[key]; end
-        def length;       cache.length; end
 
         def next_key
           "a#{@counter + 1}"
         end
 
         def []=(sql, key)
-          while @max <= cache.size
-            dealloc(cache.shift.last)
-          end
-          @counter += 1
-          cache[sql] = key
-        end
-
-        def clear
-          cache.each_value do |stmt_key|
-            dealloc stmt_key
-          end
-          cache.clear
-        end
-
-        def delete(sql_key)
-          dealloc cache[sql_key]
-          cache.delete sql_key
+          super.tap { @counter += 1 }
         end
 
         private
 
-          def cache
-            @cache[Process.pid]
-          end
+        def dealloc(key)
+          @connection.query "DEALLOCATE #{key}" if connection_active?
+        end
 
-          def dealloc(key)
-            @connection.query "DEALLOCATE #{key}" if connection_active?
-          end
-
-          def connection_active?
-            @connection.status == PGconn::CONNECTION_OK
-          rescue PGError
-            false
-          end
+        def connection_active?
+          @connection.status == PGconn::CONNECTION_OK
+        rescue PGError
+          false
+        end
       end
 
       # Initializes and connects a PostgreSQL adapter.
       def initialize(connection, logger, connection_parameters, config)
-        super(connection, logger)
-
-        @visitor = Arel::Visitors::PostgreSQL.new self
-        if self.class.type_cast_config_to_boolean(config.fetch(:prepared_statements) { true })
-          @prepared_statements = true
-        else
-          @prepared_statements = false
-        end
+        super(connection, logger, config)
 
         connection_parameters.delete :prepared_statements
-        @connection_parameters, @config = connection_parameters, config
+        @connection_parameters = connection_parameters
 
         # @local_tz is initialized as nil to avoid warnings when connect tries to use it
         @local_tz = nil
         @table_alias_length = nil
 
         connect
+        add_pg_encoders
         @statements = StatementPool.new @connection,
                                         self.class.type_cast_config_to_integer(config.fetch(:statement_limit) { 1000 })
-
+        add_pg_decoders
         @type_map = Type::HashLookupTypeMap.new
         initialize_type_map(type_map)
         @local_tz = execute('SHOW TIME ZONE', 'SCHEMA').first["TimeZone"]
-        @use_insert_returning = @config.key?(:insert_returning) ? self.class.type_cast_config_to_boolean(@config[:insert_returning]) : false
+        @use_insert_returning = @config.key?(:insert_returning) ? self.class.type_cast_config_to_boolean(@config[:insert_returning]) : true
       end
 
       # Clears the prepared statements cache.
@@ -327,6 +303,20 @@ module ActiveRecord
         redshift_version >= 90300
       end
 
+      def get_advisory_lock(lock_id) # :nodoc:
+        unless lock_id.is_a?(Integer) && lock_id.bit_length <= 63
+          raise(ArgumentError, "Postgres requires advisory lock ids to be a signed 64 bit integer")
+        end
+        select_value("SELECT pg_try_advisory_lock(#{lock_id});")
+      end
+
+      def release_advisory_lock(lock_id) # :nodoc:
+        unless lock_id.is_a?(Integer) && lock_id.bit_length <= 63
+          raise(ArgumentError, "Postgres requires advisory lock ids to be a signed 64 bit integer")
+        end
+        select_value("SELECT pg_advisory_unlock(#{lock_id})")
+      end
+
       def enable_extension(name)
         exec_query("CREATE EXTENSION IF NOT EXISTS \"#{name}\"").tap {
           reload_type_map
@@ -400,7 +390,8 @@ module ActiveRecord
           @connection.server_version
         end
 
-        # See http://www.postgresql.org/docs/9.1/static/errcodes-appendix.html
+        # See http://www.postgresql.org/docs/current/static/errcodes-appendix.html
+        VALUE_LIMIT_VIOLATION = "22001"
         FOREIGN_KEY_VIOLATION = "23503"
         UNIQUE_VIOLATION      = "23505"
 
@@ -412,6 +403,8 @@ module ActiveRecord
             RecordNotUnique.new(message, exception)
           when FOREIGN_KEY_VIOLATION
             InvalidForeignKey.new(message, exception)
+          when VALUE_LIMIT_VIOLATION
+            ValueTooLong.new(message)
           else
             super
           end
@@ -437,11 +430,11 @@ module ActiveRecord
         end
 
         def initialize_type_map(m) # :nodoc:
-          register_class_with_limit m, 'int2', OID::Integer
-          register_class_with_limit m, 'int4', OID::Integer
-          register_class_with_limit m, 'int8', OID::Integer
+          register_class_with_limit m, 'int2', Type::Integer
+          register_class_with_limit m, 'int4', Type::Integer
+          register_class_with_limit m, 'int8', Type::Integer
           m.alias_type 'oid', 'int2'
-          m.register_type 'float4', OID::Float.new
+          m.register_type 'float4', Type::Float.new
           m.alias_type 'float8', 'float4'
           m.register_type 'text', Type::Text.new
           register_class_with_limit m, 'varchar', Type::String
@@ -452,8 +445,7 @@ module ActiveRecord
           register_class_with_limit m, 'bit', OID::Bit
           register_class_with_limit m, 'varbit', OID::BitVarying
           m.alias_type 'timestamptz', 'timestamp'
-          m.register_type 'date', OID::Date.new
-          m.register_type 'time', OID::Time.new
+          m.register_type 'date', Type::Date.new
 
           m.register_type 'money', OID::Money.new
           m.register_type 'bytea', OID::Bytea.new
@@ -469,20 +461,18 @@ module ActiveRecord
           m.register_type 'macaddr', OID::SpecializedString.new(:macaddr)
           m.register_type 'citext', OID::SpecializedString.new(:citext)
           m.register_type 'ltree', OID::SpecializedString.new(:ltree)
+          m.register_type 'line', OID::SpecializedString.new(:line)
+          m.register_type 'lseg', OID::SpecializedString.new(:lseg)
+          m.register_type 'box', OID::SpecializedString.new(:box)
+          m.register_type 'path', OID::SpecializedString.new(:path)
+          m.register_type 'polygon', OID::SpecializedString.new(:polygon)
+          m.register_type 'circle', OID::SpecializedString.new(:circle)
 
           # FIXME: why are we keeping these types as strings?
           m.alias_type 'interval', 'varchar'
-          m.alias_type 'path', 'varchar'
-          m.alias_type 'line', 'varchar'
-          m.alias_type 'polygon', 'varchar'
-          m.alias_type 'circle', 'varchar'
-          m.alias_type 'lseg', 'varchar'
-          m.alias_type 'box', 'varchar'
 
-          m.register_type 'timestamp' do |_, _, sql_type|
-            precision = extract_precision(sql_type)
-            OID::DateTime.new(precision: precision)
-          end
+          register_class_with_precision m, 'time', Type::Time
+          register_class_with_precision m, 'timestamp', OID::DateTime
 
           m.register_type 'numeric' do |_, fmod, sql_type|
             precision = extract_precision(sql_type)
@@ -519,13 +509,18 @@ module ActiveRecord
         end
 
         # Extracts the value from a PostgreSQL column default definition.
-        def extract_value_from_default(oid, default) # :nodoc:
+        def extract_value_from_default(default) # :nodoc:
           case default
             # Quoted types
-            when /\A[\(B]?'(.*)'::/m
-              $1.gsub(/''/, "'")
+            when /\A[\(B]?'(.*)'.*::"?([\w. ]+)"?(?:\[\])?\z/m
+              # The default 'now'::date is CURRENT_DATE
+              if $1 == "now".freeze && $2 == "date".freeze
+                nil
+              else
+                $1.gsub("''".freeze, "'".freeze)
+              end
             # Boolean types
-            when 'true', 'false'
+            when 'true'.freeze, 'false'.freeze
               default
             # Numeric types
             when /\A\(?(-?\d+(\.\d*)?)\)?(::bigint)?\z/
@@ -545,7 +540,7 @@ module ActiveRecord
         end
 
         def has_default_function?(default_value, default) # :nodoc:
-          !default_value && (%r{\w+\(.*\)} === default)
+          !default_value && (%r{\w+\(.*\)|\(.*\)::\w+} === default)
         end
 
         def load_additional_types(type_map, oids = nil) # :nodoc:
@@ -573,45 +568,63 @@ module ActiveRecord
 
         FEATURE_NOT_SUPPORTED = "0A000" #:nodoc:
 
-        def execute_and_clear(sql, name, binds)
-          result = without_prepared_statement?(binds) ? exec_no_cache(sql, name, binds) :
-                                                        exec_cache(sql, name, binds)
+        def execute_and_clear(sql, name, binds, prepare: false)
+          result = if without_prepared_statement?(binds) || !prepare
+                     exec_no_cache(sql, name, binds)
+                   else
+                     exec_cache(sql, name, binds)
+                   end
           ret = yield result
           result.clear
           ret
         end
 
         def exec_no_cache(sql, name, binds)
-          log(sql, name, binds) { @connection.async_exec(sql, []) }
+          type_casted_binds = binds.map { |attr| type_cast(attr.value_for_database) }
+          log(sql, name, binds) { @connection.async_exec(sql, type_casted_binds) }
         end
 
         def exec_cache(sql, name, binds)
           stmt_key = prepare_statement(sql)
-          type_casted_binds = binds.map { |col, val|
-            [col, type_cast(val, col)]
-          }
+          type_casted_binds = binds.map { |attr| type_cast(attr.value_for_database) }
 
-          log(sql, name, type_casted_binds, stmt_key) do
-            @connection.exec_prepared(stmt_key, type_casted_binds.map { |_, val| val })
+          log(sql, name, binds, stmt_key) do
+            @connection.exec_prepared(stmt_key, type_casted_binds)
           end
         rescue ActiveRecord::StatementInvalid => e
-          pgerror = e.original_exception
+          raise unless is_cached_plan_failure?(e)
 
-          # Get the PG code for the failure.  Annoyingly, the code for
-          # prepared statements whose return value may have changed is
-          # FEATURE_NOT_SUPPORTED.  Check here for more details:
-          # http://git.postgresql.org/gitweb/?p=postgresql.git;a=blob;f=src/backend/utils/cache/plancache.c#l573
-          begin
-            code = pgerror.result.result_error_field(PGresult::PG_DIAG_SQLSTATE)
-          rescue
-            raise e
-          end
-          if FEATURE_NOT_SUPPORTED == code
+          # Nothing we can do if we are in a transaction because all commands
+          # will raise InFailedSQLTransaction
+          if in_transaction?
+            raise ActiveRecord::PreparedStatementCacheExpired.new(e.cause.message)
+          else
+            # outside of transactions we can simply flush this query and retry
             @statements.delete sql_key(sql)
             retry
-          else
-            raise e
           end
+        end
+
+        # Annoyingly, the code for prepared statements whose return value may
+        # have changed is FEATURE_NOT_SUPPORTED.
+        #
+        # This covers various different error types so we need to do additional
+        # work to classify the exception definitively as a
+        # ActiveRecord::PreparedStatementCacheExpired
+        #
+        # Check here for more details:
+        # http://git.postgresql.org/gitweb/?p=postgresql.git;a=blob;f=src/backend/utils/cache/plancache.c#l573
+        CACHED_PLAN_HEURISTIC = 'cached plan must not change result type'.freeze
+        def is_cached_plan_failure?(e)
+          pgerror = e.cause
+          code = pgerror.result.result_error_field(PGresult::PG_DIAG_SQLSTATE)
+          code == FEATURE_NOT_SUPPORTED && pgerror.message.include?(CACHED_PLAN_HEURISTIC)
+        rescue
+          false
+        end
+
+        def in_transaction?
+          open_transactions > 0
         end
 
         # Returns the statement identifier for the client side cache
@@ -646,7 +659,7 @@ module ActiveRecord
           # Money type has a fixed precision of 10 in PostgreSQL 8.2 and below, and as of
           # PostgreSQL 8.3 it has a fixed precision of 19. PostgreSQLColumn.extract_precision
           # should know about this but can't detect it there, so deal with it here.
-          OID::Money.precision = (redshift_version >= 80300) ? 19 : 10
+          # OID::Money.precision = (redshift_version >= 80300) ? 19 : 10
 
           configure_connection
         rescue ::PG::Error => error
@@ -663,6 +676,7 @@ module ActiveRecord
           if @config[:encoding]
             @connection.set_client_encoding(@config[:encoding])
           end
+          self.client_min_messages = @config[:min_messages] || 'warning'
           self.schema_search_path = @config[:schema_search_path] || @config[:schema_order]
 
           # SET statements from :variables config hash
@@ -678,16 +692,7 @@ module ActiveRecord
           end
         end
 
-        # Returns the current ID of a table's sequence.
-        def last_insert_id(sequence_name) #:nodoc:
-          Integer(last_insert_id_value(sequence_name))
-        end
-
-        def last_insert_id_value(sequence_name)
-          last_insert_id_result(sequence_name).rows.first.first
-        end
-
-        def last_insert_id_result(sequence_name) #:nodoc:
+        def last_insert_id_result(sequence_name) # :nodoc:
           exec_query("SELECT currval('#{sequence_name}')", 'SQL')
         end
 
@@ -710,25 +715,104 @@ module ActiveRecord
         #  - format_type includes the column size constraint, e.g. varchar(50)
         #  - ::regclass is a function that gives the id for a table name
         def column_definitions(table_name) # :nodoc:
-          exec_query(<<-end_sql, 'SCHEMA').rows
-              SELECT a.attname, format_type(a.atttypid, a.atttypmod),
-                     pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod
-                FROM pg_attribute a LEFT JOIN pg_attrdef d
-                  ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-               WHERE a.attrelid = '#{quote_table_name(table_name)}'::regclass
-                 AND a.attnum > 0 AND NOT a.attisdropped
-               ORDER BY a.attnum
+          query(<<-end_sql, 'SCHEMA')
+            SELECT a.attname, format_type(a.atttypid, a.atttypmod),
+                   pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod
+              FROM pg_attribute a LEFT JOIN pg_attrdef d
+                ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+             WHERE a.attrelid = '#{quote_table_name(table_name)}'::regclass
+               AND a.attnum > 0 AND NOT a.attisdropped
+             ORDER BY a.attnum
           end_sql
         end
 
         def extract_table_ref_from_insert_sql(sql) # :nodoc:
-          sql[/into\s+([^\(]*).*values\s*\(/im]
+          sql[/into\s("[A-Za-z0-9_."\[\]\s]+"|[A-Za-z0-9_."\[\]]+)\s*/im]
           $1.strip if $1
         end
 
         def create_table_definition(name, temporary, options, as = nil) # :nodoc:
           Redshift::TableDefinition.new native_database_types, name, temporary, options, as
         end
+
+        def can_perform_case_insensitive_comparison_for?(column)
+          @case_insensitive_cache ||= {}
+          @case_insensitive_cache[column.sql_type] ||= begin
+            sql = <<-end_sql
+                SELECT exists(
+                  SELECT * FROM pg_proc
+                  INNER JOIN pg_cast
+                    ON casttarget::text::oidvector = proargtypes
+                  WHERE proname = 'lower'
+                    AND castsource = '#{column.sql_type}'::regtype::oid
+                )
+            end_sql
+            execute_and_clear(sql, "SCHEMA", []) do |result|
+              result.getvalue(0, 0)
+            end
+          end
+        end
+
+        def add_pg_encoders
+          map = PG::TypeMapByClass.new
+          map[Integer] = PG::TextEncoder::Integer.new
+          map[TrueClass] = PG::TextEncoder::Boolean.new
+          map[FalseClass] = PG::TextEncoder::Boolean.new
+          map[Float] = PG::TextEncoder::Float.new
+          @connection.type_map_for_queries = map
+        end
+
+        def add_pg_decoders
+          coders_by_name = {
+              'int2' => PG::TextDecoder::Integer,
+              'int4' => PG::TextDecoder::Integer,
+              'int8' => PG::TextDecoder::Integer,
+              'oid' => PG::TextDecoder::Integer,
+              'float4' => PG::TextDecoder::Float,
+              'float8' => PG::TextDecoder::Float,
+              'bool' => PG::TextDecoder::Boolean,
+          }
+          known_coder_types = coders_by_name.keys.map { |n| quote(n) }
+          query = <<-SQL % known_coder_types.join(", ")
+              SELECT t.oid, t.typname
+              FROM pg_type as t
+              WHERE t.typname IN (%s)
+          SQL
+          coders = execute_and_clear(query, "SCHEMA", []) do |result|
+            result
+                .map { |row| construct_coder(row, coders_by_name[row['typname']]) }
+                .compact
+          end
+
+          map = PG::TypeMapByOid.new
+          coders.each { |coder| map.add_coder(coder) }
+          @connection.type_map_for_results = map
+        end
+
+        def construct_coder(row, coder_class)
+          return unless coder_class
+          coder_class.new(oid: row['oid'].to_i, name: row['typname'])
+        end
+
+        ActiveRecord::Type.add_modifier({ array: true }, OID::Array, adapter: :redshift)
+        ActiveRecord::Type.add_modifier({ range: true }, OID::Range, adapter: :redshift)
+        ActiveRecord::Type.register(:bit, OID::Bit, adapter: :redshift)
+        ActiveRecord::Type.register(:bit_varying, OID::BitVarying, adapter: :redshift)
+        ActiveRecord::Type.register(:binary, OID::Bytea, adapter: :redshift)
+        ActiveRecord::Type.register(:cidr, OID::Cidr, adapter: :redshift)
+        ActiveRecord::Type.register(:datetime, OID::DateTime, adapter: :redshift)
+        ActiveRecord::Type.register(:decimal, OID::Decimal, adapter: :redshift)
+        ActiveRecord::Type.register(:enum, OID::Enum, adapter: :redshift)
+        ActiveRecord::Type.register(:hstore, OID::Hstore, adapter: :redshift)
+        ActiveRecord::Type.register(:inet, OID::Inet, adapter: :redshift)
+        ActiveRecord::Type.register(:json, OID::Json, adapter: :redshift)
+        ActiveRecord::Type.register(:jsonb, OID::Jsonb, adapter: :redshift)
+        ActiveRecord::Type.register(:money, OID::Money, adapter: :redshift)
+        ActiveRecord::Type.register(:point, OID::Rails51Point, adapter: :redshift)
+        ActiveRecord::Type.register(:legacy_point, OID::Point, adapter: :redshift)
+        ActiveRecord::Type.register(:uuid, OID::Uuid, adapter: :redshift)
+        ActiveRecord::Type.register(:vector, OID::Vector, adapter: :redshift)
+        ActiveRecord::Type.register(:xml, OID::Xml, adapter: :redshift)
     end
   end
 end
