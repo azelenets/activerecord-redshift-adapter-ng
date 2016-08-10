@@ -3,10 +3,6 @@ module ActiveRecord
     module Redshift
       module OID # :nodoc:
         class Money < Type::Decimal # :nodoc:
-          include Infinity
-
-          class_attribute :precision
-
           def type
             :money
           end

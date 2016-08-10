@@ -1,3 +1,5 @@
+require 'ipaddr'
+
 module ActiveRecord
   module ConnectionAdapters
     module Redshift
@@ -18,7 +20,7 @@ module ActiveRecord
             end
           end
 
-          def type_cast_for_database(value)
+          def serialize(value)
             if IPAddr === value
               "#{value.to_s}/#{value.instance_variable_get(:@mask_addr).to_s(2).count('1')}"
             else

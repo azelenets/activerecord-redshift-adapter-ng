@@ -27,8 +27,13 @@ module ActiveRecord
         # - schema_name."table.name"
         # - "schema.name".table_name
         # - "schema.name"."table.name"
-        def quote_table_name(name)
-          Utils.extract_schema_qualified_name(name.to_s).quoted
+        def quote_table_name(name) # :nodoc:
+          @quoted_table_names[name] ||= Utils.extract_schema_qualified_name(name.to_s).quoted
+        end
+
+        # Quotes schema names for use in SQL queries.
+        def quote_schema_name(name)
+          PGconn.quote_ident(name)
         end
 
         def quote_table_name_for_assignment(table, attr)
@@ -36,32 +41,35 @@ module ActiveRecord
         end
 
         # Quotes column names for use in SQL queries.
-        def quote_column_name(name) #:nodoc:
-          PGconn.quote_ident(name.to_s)
+        def quote_column_name(name) # :nodoc:
+          @quoted_column_names[name] ||= PGconn.quote_ident(super)
         end
 
-        # Quote date/time values for use in SQL input. Includes microseconds
-        # if the value is a Time responding to usec.
+        # Quote date/time values for use in SQL input.
         def quoted_date(value) #:nodoc:
-          result = super
-          if value.acts_like?(:time) && value.respond_to?(:usec)
-            result = "#{result}.#{sprintf("%06d", value.usec)}"
-          end
-
           if value.year <= 0
             bce_year = format("%04d", -value.year + 1)
-            result = result.sub(/^-?\d+/, bce_year) + " BC"
+            super.sub(/^-?\d+/, bce_year) + " BC"
+          else
+            super
           end
-          result
         end
 
-        # Does not quote function default values for UUID columns
-        def quote_default_value(value, column) #:nodoc:
-          if column.type == :uuid && value =~ /\(\)/
-            value
+        def quote_default_expression(value, column) # :nodoc:
+          if value.is_a?(Proc)
+            value.call
+          elsif column.type == :uuid && value =~ /\(\)/
+            value # Does not quote function default values for UUID columns
+          elsif column.respond_to?(:array?)
+            value = type_cast_from_column(column, value)
+            quote(value)
           else
-            quote(value, column)
+            super
           end
+        end
+
+        def lookup_cast_type_from_column(column) # :nodoc:
+          type_map.lookup(column.oid, column.fmod, column.sql_type)
         end
 
         private
