@@ -1,5 +1,4 @@
 require 'active_record/connection_adapters/redshift/oid/infinity'
-
 require 'active_record/connection_adapters/redshift/oid/array'
 require 'active_record/connection_adapters/redshift/oid/bit'
 require 'active_record/connection_adapters/redshift/oid/bit_varying'
@@ -12,6 +11,7 @@ require 'active_record/connection_adapters/redshift/oid/enum'
 require 'active_record/connection_adapters/redshift/oid/float'
 require 'active_record/connection_adapters/redshift/oid/hstore'
 require 'active_record/connection_adapters/redshift/oid/inet'
+require 'active_record/connection_adapters/redshift/oid/rails_5_1_point'
 require 'active_record/connection_adapters/redshift/oid/integer'
 require 'active_record/connection_adapters/redshift/oid/json'
 require 'active_record/connection_adapters/redshift/oid/jsonb'
